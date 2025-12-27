@@ -28,16 +28,14 @@ environment:
 # the latest version available on pub.dev. To see which dependencies have newer
 # versions available, run `flutter pub outdated`.
 
+
 dependencies:
   flutter:
     sdk: flutter
-  
-  # Add these lines
-  http: ^1.2.1
-  flutter_tts: ^4.0.2
+  http: ^1.2.1 # Or whatever version you have
+  flutter_tts: ^4.0.2 # Or whatever version you have
+  speech_to_text: ^6.6.2 # <-- ADD THIS LINE
 
-  cupertino_icons: ^1.0.2
-  
 dev_dependencies:
   flutter_test:
     sdk: flutter

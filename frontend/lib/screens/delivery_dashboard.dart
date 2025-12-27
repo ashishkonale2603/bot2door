@@ -1,11 +1,16 @@
 import 'package:flutter/material.dart';
-import 'dart:async'; // Make sure 'dart:async' is imported for Completer
-import '../services/api_service.dart';// Import the API service
+import 'dart:async'; // For Completer
+import '../services/api_service.dart'; // Import the API service
 import 'package:flutter_tts/flutter_tts.dart'; // Import the TTS package
+import 'package:speech_to_text/speech_to_text.dart';
+import 'package:speech_to_text/speech_recognition_result.dart';
 
-// Enum to manage the state of the delivery person's UI
+// Simplified states for the new flow
 enum DeliveryFlowState {
   welcome,
+  greeting,       // "Hello, please state..."
+  listening,      // App is actively listening
+  processing,     // "Thinking..." while Gemini works
   awaitingNotification,
   otpReady,
   completed,
@@ -19,14 +24,19 @@ class DeliveryDashboardScreen extends StatefulWidget {
   State<DeliveryDashboardScreen> createState() => _DeliveryDashboardScreenState();
 }
 
-class _DeliveryDashboardScreenState extends State<DeliveryDashboardScreen> with SingleTickerProviderStateMixin {
+class _DeliveryDashboardScreenState extends State<DeliveryDashboardScreen>
+    with SingleTickerProviderStateMixin {
   DeliveryFlowState _currentState = DeliveryFlowState.welcome;
   String _spokenOtp = "";
   String _errorMessage = "";
   Timer? _pollingTimer;
-  
+
+  final SpeechToText _speechToText = SpeechToText();
+  bool _speechEnabled = false;
+  String _lastRecognizedWords = "";
+
   final ApiService _apiService = ApiService();
-  final FlutterTts _flutterTts = FlutterTts(); // Initialize TTS
+  final FlutterTts _flutterTts = FlutterTts();
 
   late AnimationController _animationController;
   late Animation<double> _scaleAnimation;
@@ -41,28 +51,170 @@ class _DeliveryDashboardScreenState extends State<DeliveryDashboardScreen> with 
     _scaleAnimation = Tween<double>(begin: 0.95, end: 1.05).animate(
       CurvedAnimation(parent: _animationController, curve: Curves.easeInOut),
     );
-    
-    // Configure TTS settings
-    _flutterTts.setLanguage("en-US");
-    _flutterTts.setSpeechRate(0.4); // Speak a bit slower
+
+    // Call our new setup functions
+    _setupTts();
+    _initSpeech();
+  }
+
+  // --- NEW: Function to set up the Indian English voice ---
+  void _setupTts() async {
+    // Wait for TTS to be ready
+
+
+    // Set default language to Indian English
+    _flutterTts.setLanguage("en-IN");
+    _flutterTts.setSpeechRate(0.5);
     _flutterTts.setPitch(1.0);
+
+    try {
+      List<dynamic> voices = await _flutterTts.getVoices;
+      
+      // Look for an "en-IN" female locale
+      dynamic indianVoice = voices.firstWhere(
+        (voice) =>
+            voice['locale'].toLowerCase().contains('en-in') &&
+            voice['name'].toLowerCase().contains('female'),
+      );
+
+      if (indianVoice != null) {
+        print("Setting to Indian voice: $indianVoice");
+        await _flutterTts.setVoice(
+            {"name": indianVoice['name'], "locale": indianVoice['locale']});
+      } else {
+        print("No specific Indian (en-IN) female voice found. Using default.");
+      }
+    } catch (e) {
+      print("Could not get or set voices: $e. Using default.");
+    }
+  }
+
+  void _initSpeech() async {
+    _speechEnabled = await _speechToText.initialize(
+      onError: (error) => print('STT Error: $error'),
+      onStatus: (status) => print('STT Status: $status'),
+    );
+    setState(() {});
   }
 
   @override
   void dispose() {
     _pollingTimer?.cancel();
     _animationController.dispose();
+    _speechToText.stop();
+    _flutterTts.stop();
     super.dispose();
   }
 
-  Future<void> _startDeliveryProcess() async {
+  Future<void> _speak(String text, {required Function onComplete}) async {
+    final Completer<void> ttsCompleter = Completer();
+    _flutterTts.setCompletionHandler(() {
+      if (!ttsCompleter.isCompleted) {
+        ttsCompleter.complete();
+      }
+    });
+
+    await _flutterTts.speak(text);
+    await ttsCompleter.future;
+
+    if (mounted) {
+      onComplete();
+    }
+  }
+
+  // Step 1 - Start the single-prompt conversation
+  Future<void> _startConversation() async {
+    setState(() {
+      _currentState = DeliveryFlowState.greeting;
+      _lastRecognizedWords = "";
+    });
+
+    _speak(
+      "Hello, and welcome to Bot2Door. Please state your company and the purpose of your delivery.",
+      onComplete: _startListening,
+    );
+  }
+
+  // Step 2 - Listen for the single, complete phrase
+  void _startListening() {
+    setState(() => _currentState = DeliveryFlowState.listening);
+    _lastRecognizedWords = "";
+    _speechToText.listen(
+      onResult: _onSpeechResult,
+      listenFor: const Duration(seconds: 15), // Listen for longer
+      pauseFor: const Duration(seconds: 4), // Wait 4s for silence
+      localeId: "en_IN", // --- CHANGED: Listen for Indian English ---
+    );
+  }
+
+  // Step 3 - Handle the final speech result
+  void _onSpeechResult(SpeechRecognitionResult result) {
+    setState(() {
+      _lastRecognizedWords = result.recognizedWords;
+    });
+
+    if (result.finalResult) {
+      print("Raw text collected: ${result.recognizedWords}");
+      _processSpeech(result.recognizedWords);
+    }
+  }
+
+  // Step 4 - Call the Gemini backend
+  Future<void> _processSpeech(String rawText) async {
+    setState(() => _currentState = DeliveryFlowState.processing);
+
+    if (rawText.isEmpty) {
+      // Handle case where user didn't say anything
+      _speak("Sorry, I didn't hear anything. Please try again.", onComplete: () {
+        setState(() => _currentState = DeliveryFlowState.welcome);
+      });
+      return;
+    }
+
+    try {
+      final extractedData = await _apiService.understandSpeech(rawText);
+      final company = extractedData['company_name'];
+      final info = extractedData['delivery_info'];
+
+      print("Gemini Extracted: Company=$company, Info=$info");
+
+      if (company == "unknown" || info == "unknown") {
+        // Handle if Gemini couldn't figure it out
+        _speak(
+          "Sorry, I didn't quite catch that. Could you please try again?",
+          onComplete: () {
+            setState(() => _currentState = DeliveryFlowState.welcome);
+          },
+        );
+      } else {
+        // SUCCESS! Now call the original backend process
+        _speak(
+          "Thank you. Please wait one moment while I notify the homeowner.",
+          onComplete: () {
+            _startBackendProcess(company, info);
+          },
+        );
+      }
+    } catch (e) {
+      print("Error processing speech: $e");
+      setState(() {
+        _currentState = DeliveryFlowState.error;
+        _errorMessage = "Sorry, I had trouble understanding. Please try again.";
+      });
+    }
+  }
+
+  // Step 5 - Now accepts arguments
+  Future<void> _startBackendProcess(String company, String info) async {
     setState(() {
       _currentState = DeliveryFlowState.awaitingNotification;
       _errorMessage = "";
     });
 
     try {
-      await _apiService.startDelivery();
+      // Pass the Gemini-extracted data to the backend
+      await _apiService.startDelivery(company, info);
+
       _pollingTimer = Timer.periodic(const Duration(seconds: 2), (timer) async {
         final status = await _apiService.checkStatus();
         if (status == 'otp_ready') {
@@ -77,25 +229,25 @@ class _DeliveryDashboardScreenState extends State<DeliveryDashboardScreen> with 
       });
     }
   }
-  
+
   Future<void> _cancelDelivery() async {
-    _pollingTimer?.cancel(); // Stop polling immediately
-    
+    _pollingTimer?.cancel();
+    _speechToText.stop();
+    _flutterTts.stop();
+
     try {
-      await _apiService.cancelDelivery(); // Tell backend to cancel
+      await _apiService.cancelDelivery();
       setState(() {
-        _currentState = DeliveryFlowState.welcome; // Go back to home
+        _currentState = DeliveryFlowState.welcome;
       });
     } catch (e) {
-      // If cancellation fails, just go back to welcome
       setState(() {
         _currentState = DeliveryFlowState.welcome;
         _errorMessage = "Could not cancel. Resetting.";
       });
     }
   }
-  
-  // --- THIS FUNCTION CONTAINS THE FIX ---
+
   Future<void> _fetchAndSpeakOtp() async {
     try {
       final otp = await _apiService.getSpokenOtp();
@@ -104,39 +256,27 @@ class _DeliveryDashboardScreenState extends State<DeliveryDashboardScreen> with 
         _spokenOtp = otp;
       });
 
-      // 1. Create a Completer to wait for TTS
-      final Completer<void> ttsCompleter = Completer();
-      
-      // 2. Tell the TTS engine to call us when it's done
-      _flutterTts.setCompletionHandler(() {
-        if (!ttsCompleter.isCompleted) {
-          ttsCompleter.complete();
-        }
-      });
-
-      // 3. Start speaking
-      await _flutterTts.speak(_spokenOtp);
-
-      // 4. Wait here until the setCompletionHandler is called
-      await ttsCompleter.future; 
-      
-      // --- The 4-second hardcoded delay is now gone ---
-      
-      // 5. Now that speaking is *actually* finished, move on
-      if (mounted) {
-        setState(() => _currentState = DeliveryFlowState.completed);
-        await Future.delayed(const Duration(seconds: 3)); // Keep "Completed" for 3s
-        if (mounted) {
-          setState(() => _currentState = DeliveryFlowState.welcome);
-        }
-      }
+      _speak(
+        _spokenOtp,
+        onComplete: () async {
+          if (mounted) {
+            setState(() => _currentState = DeliveryFlowState.completed);
+            await Future.delayed(const Duration(seconds: 3));
+            if (mounted) {
+              setState(() => _currentState = DeliveryFlowState.welcome);
+            }
+          }
+        },
+      );
     } catch (e) {
-       setState(() {
+      setState(() {
         _currentState = DeliveryFlowState.error;
         _errorMessage = "Failed to retrieve the OTP from the server.";
       });
     }
   }
+
+  // --- UI Builder Methods ---
 
   @override
   Widget build(BuildContext context) {
@@ -173,7 +313,8 @@ class _DeliveryDashboardScreenState extends State<DeliveryDashboardScreen> with 
                 borderRadius: BorderRadius.circular(16),
               ),
               child: Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 40.0, vertical: 24.0),
+                padding: const EdgeInsets.symmetric(
+                    horizontal: 40.0, vertical: 24.0),
                 child: AnimatedSwitcher(
                   duration: const Duration(milliseconds: 500),
                   transitionBuilder: (child, animation) {
@@ -189,21 +330,45 @@ class _DeliveryDashboardScreenState extends State<DeliveryDashboardScreen> with 
     );
   }
 
-  // --- UI Builder Methods ---
-  // (No changes from here down)
-  // ---
 
   Widget _buildContentForState() {
     switch (_currentState) {
       case DeliveryFlowState.welcome:
         return _buildWelcomeView(key: const ValueKey('welcome'));
+
+      case DeliveryFlowState.greeting:
+        return _buildWaitingView(
+          key: const ValueKey('greeting'),
+          icon: Icons.record_voice_over,
+          color: Theme.of(context).colorScheme.primary,
+          text: "Please answer the question...",
+          showSpinner: true,
+          showCancelButton: true,
+        );
+
+      case DeliveryFlowState.listening:
+        return _buildListeningView(
+          key: const ValueKey('listen'),
+          prompt: "Please state your company and delivery info...",
+        );
+
+      case DeliveryFlowState.processing:
+        return _buildWaitingView(
+          key: const ValueKey('processing'),
+          icon: Icons.auto_awesome, // "Magic" icon
+          color: Theme.of(context).colorScheme.secondary,
+          text: "Processing...",
+          showSpinner: true,
+          showCancelButton: true,
+        );
+
       case DeliveryFlowState.awaitingNotification:
         return _buildWaitingView(
           key: const ValueKey('waiting'),
           icon: Icons.wifi_tethering_rounded,
           color: Theme.of(context).colorScheme.secondary,
           text: "Notifying Homeowner...",
-          showCancelButton: true, // Show the cancel button
+          showCancelButton: true,
         );
       case DeliveryFlowState.otpReady:
         return _buildOtpView(key: const ValueKey('otpReady'));
@@ -216,8 +381,9 @@ class _DeliveryDashboardScreenState extends State<DeliveryDashboardScreen> with 
           showSpinner: false,
         );
       case DeliveryFlowState.error:
-         return _buildErrorView(key: const ValueKey('error'));
+        return _buildErrorView(key: const ValueKey('error'));
     }
+    return _buildWelcomeView(key: const ValueKey('default')); // Fallback
   }
 
   Widget _buildWelcomeView({required Key key}) {
@@ -238,7 +404,8 @@ class _DeliveryDashboardScreenState extends State<DeliveryDashboardScreen> with 
         const Text(
           "Bot2Door",
           textAlign: TextAlign.center,
-          style: TextStyle(fontSize: 40, fontWeight: FontWeight.bold, letterSpacing: 1.5),
+          style: TextStyle(
+              fontSize: 40, fontWeight: FontWeight.bold, letterSpacing: 1.5),
         ),
         const SizedBox(height: 12),
         Text(
@@ -249,7 +416,7 @@ class _DeliveryDashboardScreenState extends State<DeliveryDashboardScreen> with 
         const SizedBox(height: 60),
         ElevatedButton.icon(
           icon: const Icon(Icons.play_arrow_rounded),
-          onPressed: _startDeliveryProcess,
+          onPressed: _speechEnabled ? _startConversation : null,
           label: const Text("Start Delivery"),
         ),
         const Spacer(),
@@ -268,7 +435,7 @@ class _DeliveryDashboardScreenState extends State<DeliveryDashboardScreen> with 
     required Color color,
     required String text,
     bool showSpinner = true,
-    bool showCancelButton = false, // Add new parameter
+    bool showCancelButton = false,
   }) {
     return Column(
       key: key,
@@ -281,7 +448,7 @@ class _DeliveryDashboardScreenState extends State<DeliveryDashboardScreen> with 
           textAlign: TextAlign.center,
           style: const TextStyle(fontSize: 24, fontWeight: FontWeight.w600),
         ),
-        if(showSpinner) ...[
+        if (showSpinner) ...[
           const SizedBox(height: 40),
           CircularProgressIndicator(
             valueColor: AlwaysStoppedAnimation<Color>(color),
@@ -291,14 +458,13 @@ class _DeliveryDashboardScreenState extends State<DeliveryDashboardScreen> with 
         if (showCancelButton) ...[
           const SizedBox(height: 32),
           TextButton(
-            onPressed: _cancelDelivery, // Hook up the cancel method
+            onPressed: _cancelDelivery,
             child: const Text(
               "Cancel Delivery",
               style: TextStyle(
-                fontSize: 16,
-                color: Colors.redAccent,
-                fontWeight: FontWeight.w600
-              ),
+                  fontSize: 16,
+                  color: Colors.redAccent,
+                  fontWeight: FontWeight.w600),
             ),
           )
         ]
@@ -306,12 +472,61 @@ class _DeliveryDashboardScreenState extends State<DeliveryDashboardScreen> with 
     );
   }
 
-  Widget _buildOtpView({required Key key}) {
+  Widget _buildListeningView({required Key key, required String prompt}) {
     return Column(
       key: key,
       mainAxisAlignment: MainAxisAlignment.center,
       children: [
-        Icon(Icons.speaker_phone_rounded, size: 80, color: Theme.of(context).colorScheme.primary),
+        Icon(Icons.mic,
+            size: 80, color: Theme.of(context).colorScheme.secondary),
+        const SizedBox(height: 24),
+        Text(
+          prompt,
+          textAlign: TextAlign.center,
+          style: const TextStyle(fontSize: 22, fontWeight: FontWeight.w600),
+        ),
+        const SizedBox(height: 40),
+        const Text(
+          "Listening...",
+          style: TextStyle(
+              fontSize: 16,
+              color: Colors.grey,
+              fontStyle: FontStyle.italic),
+        ),
+        const SizedBox(height: 12),
+        Container(
+          height: 100,
+          child: Text(
+            _lastRecognizedWords,
+            textAlign: TextAlign.center,
+            style: const TextStyle(
+              fontSize: 20,
+              fontWeight: FontWeight.bold,
+            ),
+          ),
+        ),
+        const SizedBox(height: 32),
+        TextButton(
+          onPressed: _cancelDelivery,
+          child: const Text(
+            "Cancel Delivery",
+            style: TextStyle(
+                fontSize: 16,
+                color: Colors.redAccent,
+                fontWeight: FontWeight.w600),
+          ),
+        )
+      ],
+    );
+  }
+
+  Widget _buildOtpView({required Key key}) {
+     return Column(
+      key: key,
+      mainAxisAlignment: MainAxisAlignment.center,
+      children: [
+        Icon(Icons.speaker_phone_rounded,
+            size: 80, color: Theme.of(context).colorScheme.primary),
         const SizedBox(height: 24),
         const Text(
           "Speaking OTP:",
@@ -319,30 +534,33 @@ class _DeliveryDashboardScreenState extends State<DeliveryDashboardScreen> with 
         ),
         const SizedBox(height: 20),
         Text(
-          _spokenOtp.replaceAll('...', ' '), // Display OTP with spaces
+          _spokenOtp.replaceAll('...', ' '),
           style: const TextStyle(
-            fontSize: 42,
-            fontWeight: FontWeight.bold,
-            letterSpacing: 8,
-            color: Colors.black87
-          ),
+              fontSize: 42,
+              fontWeight: FontWeight.bold,
+              letterSpacing: 8,
+              color: Colors.black87),
         ),
       ],
     );
   }
 
   Widget _buildErrorView({required Key key}) {
-    return Column(
+     return Column(
       key: key,
       mainAxisAlignment: MainAxisAlignment.center,
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        const Icon(Icons.error_outline_rounded, size: 80, color: Colors.redAccent),
+        const Icon(Icons.error_outline_rounded,
+            size: 80, color: Colors.redAccent),
         const SizedBox(height: 24),
         const Text(
           "Connection Error",
           textAlign: TextAlign.center,
-          style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold, color: Colors.redAccent),
+          style: TextStyle(
+              fontSize: 24,
+              fontWeight: FontWeight.bold,
+              color: Colors.redAccent),
         ),
         const SizedBox(height: 12),
         Text(
@@ -352,7 +570,8 @@ class _DeliveryDashboardScreenState extends State<DeliveryDashboardScreen> with 
         ),
         const SizedBox(height: 40),
         ElevatedButton(
-          onPressed: () => setState(() => _currentState = DeliveryFlowState.welcome),
+          onPressed: () =>
+              setState(() => _currentState = DeliveryFlowState.welcome),
           child: const Text("Try Again"),
         ),
       ],

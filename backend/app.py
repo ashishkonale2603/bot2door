@@ -154,6 +154,7 @@ def speak_otp():
     else:
         return jsonify({"status": "error", "message": "OTP is not ready or has already been provided."}), 404
 
+
 @app.route('/cancel-delivery', methods=['POST'])
 def cancel_delivery():
     global delivery_state

@@ -17,6 +17,7 @@ if not GEMINI_API_KEY:
 
 
 genai.configure(api_key=GEMINI_API_KEY)
+
 # Initialize the model (use 'gemini-pro' as it's widely available)
 gemini_model = genai.GenerativeModel("gemini-2.0-flash-lite")
 # -----------------------------------------------

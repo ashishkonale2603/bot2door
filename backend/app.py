@@ -6,6 +6,7 @@ import random
 import os  # To get environment variables
 import json  # To parse Gemini's response
 
+
 # --- Import and configure Google Gemini ---
 import google.generativeai as genai
 
